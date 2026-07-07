@@ -1,11 +1,10 @@
-
-Action: file_editor create /app/streamlit_app/.streamlit/config.toml --file-text "[theme]
-base = \"dark\"
-primaryColor = \"#00c8ff\"
-backgroundColor = \"#020813\"
-secondaryBackgroundColor = \"#0a192f\"
-textColor = \"#e2e8f0\"
-font = \"monospace\"
+[theme]
+base = "dark"
+primaryColor = "#00c8ff"
+backgroundColor = "#020813"
+secondaryBackgroundColor = "#0a192f"
+textColor = "#e2e8f0"
+font = "monospace"
 
 [server]
 headless = true
@@ -13,5 +12,3 @@ enableCORS = false
 
 [browser]
 gatherUsageStats = false
-"
-Observation: Create successful: /app/streamlit_app/.streamlit/config.toml
