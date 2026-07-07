@@ -1,146 +1,90 @@
-# Indian Stocks Forecast Pro
 
-A modern Streamlit dashboard for Indian stock analysis using Yahoo Finance data, technical indicators, ARIMA forecasting, Exponential Smoothing, backtesting, and market structure analysis.
+Action: file_editor create /app/streamlit_app/README.md --file-text "# XERCES // Quant Engine
+
+A next-generation Streamlit dashboard for Indian equity (NSE/BSE) analysis — 600+ stocks across 18 sectors, complete with technical indicators, AI analyst, forecasting, backtesting, and portfolio optimization.
 
 ## Features
 
-- Historical stock data from Yahoo Finance.
-- Supports Indian tickers like `TCS.NS`, `INFY.NS`, `RELIANCE.NS`, and more.
-- Trend analysis using SMA 20, SMA 50, EMA 20, and RSI 14.
-- Forecasting with:
-  - ARIMA
-  - Exponential Smoothing
-- Backtesting against a simple moving-average crossover strategy.
-- Buy / Hold / Exit signal panel.
-- Market Structure tab with:
-  - Anchored VWAP
-  - Volume Profile
-  - Liquidity Sweep detection
-  - FVG / IFVG-style imbalance zones
-  - AMD regime label
-  - Combined context score
-- Dark premium UI with Streamlit theme configuration.
-- CSV download for forecast results.
+### 📊 Core Analytics (11 tabs)
+- **Chart** — Candlesticks, SMA 20/50/200, Bollinger Bands, RSI, MACD, Stochastic, Volume
+- **Forecast** — ARIMA (5×5 AIC grid search) + Holt-Winters consensus with 60-day MAPE + directional accuracy
+- **Backtest** — 4 strategies (SMA/RSI/BB/MACD) on 5-year data, next-day open execution
+- **Scanner** — Bulk multi-sector scanner with BUY/SELL/HOLD signals + position sizing
+- **Risk Calculator** — Position-sizing based on ATR and R:R
+- **Portfolio** — MPT optimizer (3000 Monte Carlo simulations) + custom portfolio tracker with rotation advisor
+- **FII/DII Flows** — Live NSE institutional flow data
+- **Options Chain** — Full option chain, PCR, Max Pain analysis
+- **Fundamentals** — P/E, P/B, ROE, ROCE, Debt/Equity, EPS from Screener.in
+- **News & Sentiment** — Google News / Yahoo RSS with keyword-based sentiment scoring
+- **Manual** — Complete reference guide
 
-## Important note
+### 🚀 XERCES+ Enhancements (5 new tabs)
+- **🔥 Heatmap** — Live 1-day sector performance + 5-min intraday candles
+- **🔄 Compare** — Side-by-side 2–4 stocks with correlation matrix + risk/return stats
+- **🤖 AI Analyst** — Multi-turn chatbot powered by Claude Sonnet 4.6 / GPT-5.4 / Gemini. One-click trade thesis & news summarization
+- **📓 Journal** — Persistent trade log with P&L tracking, win-rate, equity curve
+- **📄 Export** — PDF stock reports (with optional AI thesis) + multi-sheet Excel workbook
 
-This app is for educational and analytical purposes only. Forecasts are not guaranteed, and the market can behave unpredictably. Use proper risk management and do your own research before making trading decisions.
+### ⭐ Sidebar
+- **Watchlist** — Persistent, add/remove any stock
+- **Alerts** — Price / RSI threshold alerts, auto-triggered on refresh
 
-## Tech Stack
+---
 
-- Python
-- Streamlit
-- yfinance
-- Pandas
-- NumPy
-- Plotly
-- Statsmodels
-- scikit-learn
-
-## Project Structure
-
-```txt
-your-repo-name/
-├── app.py
-├── requirements.txt
-├── README.md
-└── .streamlit/
-    └── config.toml
-```
-
-## Installation
-
-### 1. Clone the repository
+## Run Locally
 
 ```bash
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
-```
-
-### 2. Create a virtual environment
-
-```bash
-python -m venv venv
-```
-
-### 3. Activate the virtual environment
-
-On Windows:
-
-```bash
-venv\Scripts\activate
-```
-
-On macOS/Linux:
-
-```bash
-source venv/bin/activate
-```
-
-### 4. Install dependencies
-
-```bash
+git clone https://github.com/pvdeveshwar18-code/arima.git
+cd arima
 pip install -r requirements.txt
-```
-
-## Run locally
-
-```bash
 streamlit run app.py
 ```
 
-## How to use
+Opens at `http://localhost:8501`.
 
-1. Enter one or more Indian stock tickers, one per line.
-2. Choose the history range, interval, and forecast horizon.
-3. Click **Run analysis**.
-4. Review:
-   - overview charts
-   - forecast chart
-   - strategy backtest
-   - comparison table
-   - market structure tab
+---
 
-## Example tickers
+## Deploy to Streamlit Community Cloud (free public URL)
 
-```txt
-TCS.NS
-INFY.NS
-RELIANCE.NS
-HDFCBANK.NS
-SBIN.NS
-ICICIBANK.NS
-ITC.NS
-LT.NS
+1. **Push these files to your repo:**
+   - `app.py` (the new enhanced version)
+   - `xerces_plus.py` (new — enhancement module)
+   - `requirements.txt` (updated)
+   - `.streamlit/config.toml` (optional theme file)
+   - `readme.md`
+
+2. **Add a secret for AI features:**
+   - Go to [share.streamlit.io](https://share.streamlit.io) → deploy your app
+   - In the app settings, add a secret:
+     ```toml
+     EMERGENT_LLM_KEY = \"sk-emergent-2191f894997De47509\"
+     ```
+   - Or use your own OpenAI / Anthropic / Google key — see below.
+
+3. **Done.** You'll get a permanent URL like `https://xerces.streamlit.app`.
+
+---
+
+## Using Your Own LLM Key (optional)
+
+XERCES ships with the Emergent LLM Key, which works across Claude, GPT, and Gemini. If you want to bypass it, open `xerces_plus.py` and swap this line:
+
+```python
+EMERGENT_LLM_KEY = os.environ.get(\"EMERGENT_LLM_KEY\", \"sk-emergent-2191f894997De47509\")
 ```
 
-## Deployment on Streamlit Cloud
+Replace with your own key (OpenAI / Anthropic / Google) and update the provider in `_ai_chat_async` accordingly.
 
-1. Push the repository to GitHub.
-2. Make sure `app.py`, `requirements.txt`, and `.streamlit/config.toml` are in the repository.
-3. Go to [Streamlit Community Cloud](https://share.streamlit.io/).
-4. Connect your GitHub account.
-5. Click **New app**.
-6. Select your repository, branch, and `app.py` as the main file.
-7. Deploy the app.
+---
 
-## Troubleshooting
+## Persistence
 
-### No data returned
-- Check that the ticker is valid.
-- Use `.NS` for NSE symbols.
-- Try a major ticker like `INFY.NS` or `RELIANCE.NS`.
+XERCES stores watchlist / alerts / journal in the `data/` folder as JSON/CSV — created automatically on first use.
 
-### App fails on Streamlit Cloud
-- Make sure `requirements.txt` is in the repository root.
-- Ensure `.streamlit/config.toml` is inside the `.streamlit` folder.
-- Re-deploy after updating dependencies.
+---
 
-### Forecast looks weak or empty
-- Use a longer history range like `5y`.
-- Some stocks may not have enough data for ARIMA or backtesting.
-- Try the daily interval instead of weekly for more detail.
+## Disclaimer
 
-## License
-
-For educational use only.
+XERCES is a research and analysis tool. Not SEBI registered. Not financial advice. Data from Yahoo Finance / NSE / Screener.in. Always do your own due diligence.
+"
+Observation: Create successful: /app/streamlit_app/README.md
