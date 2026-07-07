@@ -277,6 +277,30 @@ for sector, stocks in SECTORS.items():
         if key not in ALL_STOCKS:
             ALL_STOCKS[key] = f"{sym}.NS"
 
+# ── TICKER RESOLUTION HELPERS ────────────────────────────────────────────────
+def resolve_ticker(ticker_input):
+    ticker_input = ticker_input.strip().upper()
+    if ticker_input.endswith(".NS") or ticker_input.endswith(".BO") or "^" in ticker_input:
+        return ticker_input
+    for key, val in ALL_STOCKS.items():
+        sym = val.replace(".NS","").replace(".BO","").upper()
+        if ticker_input == sym:
+            return val
+    return f"{ticker_input}.NS"
+
+def get_sector_peers(ticker_symbol, max_peers=2):
+    clean = ticker_symbol.replace(".NS","").replace(".BO","").upper()
+    for sector, list_of_stocks in SECTORS.items():
+        if any(sym == clean for _, sym in list_of_stocks):
+            peers = []
+            for name, sym in list_of_stocks:
+                if sym != clean:
+                    peers.append(f"{sym}.NS")
+                    if len(peers) >= max_peers:
+                        break
+            return sector, peers
+    return None, []
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE DATA HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -284,7 +308,7 @@ for sector, stocks in SECTORS.items():
 def load_ohlcv(ticker: str, period: str = "5y"):
     try:
         df = yf.download(ticker, period=period, interval="1d", auto_adjust=True,
-                          progress=False, timeout=10)
+                          progress=False, timeout=12)
         if df is None or df.empty:
             return None
         if isinstance(df.columns, pd.MultiIndex):
@@ -300,14 +324,6 @@ def load_ohlcv(ticker: str, period: str = "5y"):
         return None
 
 def _download_raw(ticker: str, period: str = "1y"):
-    """
-    Thread-safe, uncached download used ONLY inside ThreadPoolExecutor workers.
-    Streamlit's @st.cache_data is not safe to call concurrently from multiple
-    threads (it has historically caused deadlocks/hangs under parallel writes),
-    so the scanner's worker threads must never call the cached load_ohlcv().
-    A hard timeout also guarantees a worker can never hang forever waiting
-    on a slow/rate-limited Yahoo Finance response.
-    """
     try:
         df = yf.download(ticker, period=period, interval="1d", auto_adjust=True,
                           progress=False, timeout=8, threads=False)
@@ -357,12 +373,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out["ATR_14"] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
     else:
         out["ATR_14"] = c.rolling(14).std()
-    # Stochastic %K %D
     low14  = out["Low"].astype(float).rolling(14).min() if "Low" in out.columns else c.rolling(14).min()
     high14 = out["High"].astype(float).rolling(14).max() if "High" in out.columns else c.rolling(14).max()
     out["Stoch_K"] = (c - low14) / (high14 - low14 + 1e-9) * 100
     out["Stoch_D"] = out["Stoch_K"].rolling(3).mean()
-    # OBV
     if "Volume" in out.columns:
         vol = out["Volume"].astype(float)
         obv = [0.0]
@@ -397,7 +411,6 @@ def get_signal(df: pd.DataFrame) -> str:
     return "HOLD"
 
 def get_signal_strength(df: pd.DataFrame) -> int:
-    """Returns 0-100 composite signal strength score."""
     if len(df) < 52:
         return 50
     last = df.iloc[-1]
@@ -424,7 +437,7 @@ def get_signal_strength(df: pd.DataFrame) -> int:
         pass
     return max(0, min(100, score))
 
-# ── ARIMA + Holt-Winters (no cache on Series input — BUG FIX) ────────────────
+# ── ARIMA + Holt-Winters ─────────────────────────────────────────────────────
 def run_arima(series: pd.Series, steps: int = 260):
     log_s = np.log(series.astype(float).dropna())
     d = 0 if adfuller(log_s)[1] < 0.05 else 1
@@ -456,7 +469,6 @@ def run_holt_winters(series: pd.Series, steps: int = 260):
         return pd.Series([float(s.iloc[-1]) + drift * i for i in range(1, steps + 1)])
 
 def compute_accuracy(price_series: pd.Series, arima_order: tuple, holdout: int = 60):
-    """60-day holdout validation — returns MAPE, directional accuracy."""
     try:
         if len(price_series) < holdout + 100:
             return None, None
@@ -495,16 +507,9 @@ def load_indices():
 # ── News + sentiment ──────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_news(ticker: str, company_name: str = ""):
-    """
-    Yahoo's legacy RSS headline feed is largely dead for most tickers now,
-    so Google News RSS (which is still live and covers Indian stocks well)
-    is used as the primary source, with Yahoo as a fallback.
-    """
     clean = ticker.replace(".NS", "").replace(".BO", "")
     query = company_name.strip() if company_name.strip() else clean
     items = []
-
-    # Primary: Google News RSS — reliable, no auth needed
     try:
         gquery = urllib.parse.quote(f"{query} stock NSE")
         gurl = f"https://news.google.com/rss/search?q={gquery}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -523,7 +528,6 @@ def fetch_news(ticker: str, company_name: str = ""):
     if items:
         return items
 
-    # Fallback: legacy Yahoo headline feed (works for some large-caps)
     try:
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={clean}&region=IN&lang=en-IN"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -552,7 +556,6 @@ def sentiment_score(items):
         words = set(tl.split())
         bull = len(words & BULL_KW)
         bear = len(words & BEAR_KW)
-        # Simple negation: if "not" or "no" precedes a bull word, flip it
         for bw in BULL_KW:
             if f"not {bw}" in tl or f"no {bw}" in tl:
                 bull -= 2
@@ -616,7 +619,6 @@ def run_backtest(df: pd.DataFrame, strategy: str):
         if row["Position"] == 1 and not in_trade and idx + 1 < len(bt):
             nxt = bt.iloc[idx + 1]
             in_trade, entry_price, entry_date = True, float(nxt["Open"]), nxt["Date"]
-            # BUG FIX: markers below/above candle
             buy_x.append(nxt["Date"])
             buy_y.append(float(nxt["Low"]) * 0.985 if pd.notna(nxt.get("Low")) else float(nxt["Open"]))
         elif row["Position"] == -1 and in_trade and idx + 1 < len(bt):
@@ -637,7 +639,6 @@ def run_backtest(df: pd.DataFrame, strategy: str):
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fii_dii():
-    """Fetch FII/DII daily trade data from NSE India public API."""
     url = "https://www.nseindia.com/api/fiidiiTradeReact"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -647,7 +648,6 @@ def fetch_fii_dii():
     }
     try:
         req = urllib.request.Request(url, headers=headers)
-        # First hit the main page to get cookies
         main_req = urllib.request.Request("https://www.nseindia.com", headers=headers)
         import http.cookiejar
         cj = http.cookiejar.CookieJar()
@@ -661,7 +661,6 @@ def fetch_fii_dii():
         return None
 
 def parse_fii_dii(data):
-    """Parse FII/DII API response into clean DataFrames."""
     if not data:
         return None, None
     try:
@@ -695,7 +694,6 @@ def parse_fii_dii(data):
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_options_chain(symbol: str):
-    """Fetch options chain from NSE India for a given symbol."""
     clean = symbol.replace(".NS","").replace(".BO","").upper()
     url = f"https://www.nseindia.com/api/option-chain-equities?symbol={clean}"
     headers = {
@@ -718,7 +716,6 @@ def fetch_options_chain(symbol: str):
         return None
 
 def parse_options_chain(data, spot_price: float):
-    """Parse options chain → max pain, PCR, strike table."""
     if not data:
         return None, None, None, None
     try:
@@ -751,12 +748,10 @@ def parse_options_chain(data, spot_price: float):
 
         df_chain = pd.DataFrame(rows).sort_values("Strike")
 
-        # PCR — Put/Call Ratio by OI
         total_ce_oi = df_chain["CE OI"].sum()
         total_pe_oi = df_chain["PE OI"].sum()
         pcr = round(total_pe_oi / total_ce_oi, 3) if total_ce_oi > 0 else None
 
-        # Max Pain — strike where total loss to option buyers is maximum
         strikes = df_chain["Strike"].values
         ce_ois  = df_chain["CE OI"].values
         pe_ois  = df_chain["PE OI"].values
@@ -775,25 +770,6 @@ def parse_options_chain(data, spot_price: float):
 # FUNDAMENTAL DATA — screener.in scraper
 # ══════════════════════════════════════════════════════════════════════════════
 def _parse_ratio_li(html: str, label: str):
-    """
-    Screener.in renders each top ratio as an <li>, but the label text is
-    SOMETIMES wrapped in an <a> tag (ratios with a glossary tooltip, e.g.
-    P/E, ROCE, Debt to equity) and sometimes a bare <span> (e.g. ROE,
-    Dividend Yield). Both forms must be matched or roughly half the ratios
-    silently return None and show as N/A even though the data exists.
-
-    <li class="flex flex-space-between">
-      <span class="name">Stock P/E</span>                       <- bare form
-      OR
-      <span class="name"><a href="...">ROCE</a></span>           <- linked form
-      <span class="nowrap value"><span ...>27.4</span></span>
-    </li>
-
-    We isolate the <li>...</li> block whose name-span contains this label
-    (regardless of an inner <a> tag), then pull the LAST numeric token
-    inside that block's value span — avoids matching unrelated numbers
-    (chart IDs, CSS values) elsewhere on the page.
-    """
     li_pattern = re.compile(
         r'<li[^>]*>\s*<span class="name">\s*(?:<a[^>]*>)?\s*' + re.escape(label) +
         r'\s*(?:</a>)?\s*</span>(.*?)</li>', re.IGNORECASE | re.DOTALL
@@ -811,14 +787,12 @@ def _parse_ratio_li(html: str, label: str):
         return None
 
 def _sane(value, lo, hi):
-    """Reject obviously-garbage scraped numbers (wrong magnitude)."""
     if value is None:
         return None
     return value if lo <= value <= hi else None
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fundamentals(symbol: str):
-    """Scrape key ratios from screener.in for an NSE symbol, with range validation."""
     clean = symbol.replace(".NS", "").replace(".BO", "").upper()
     url   = f"https://www.screener.in/company/{clean}/consolidated/"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -827,8 +801,6 @@ def fetch_fundamentals(symbol: str):
         with urllib.request.urlopen(req, timeout=10) as r:
             html = r.read().decode("utf-8", errors="ignore")
     except Exception:
-        # Try standalone (non-consolidated) page as fallback — some companies
-        # (esp. those without subsidiaries) only have the standalone version
         try:
             url2 = f"https://www.screener.in/company/{clean}/"
             req2 = urllib.request.Request(url2, headers=headers)
@@ -857,6 +829,18 @@ def fetch_fundamentals(symbol: str):
         "EPS (TTM)":      eps,
         "Div Yield (%)":  dy,
     }, url
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INITIALIZE FORECAST SESSION STATE
+# ══════════════════════════════════════════════════════════════════════════════
+if "fc_horizon_type" not in st.session_state:
+    st.session_state["fc_horizon_type"] = "Swing Trade (Days)"
+if "fc_steps" not in st.session_state:
+    st.session_state["fc_steps"] = 60
+if "fc_years" not in st.session_state:
+    st.session_state["fc_years"] = 2
+if "fc_history_period" not in st.session_state:
+    st.session_state["fc_history_period"] = "2y"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HEADER
@@ -899,11 +883,9 @@ if search:
     is_dashboard = False
     match_t, match_n = None, None
     sl = search.lower()
-    # 1. name match
     for label, ticker in ALL_STOCKS.items():
         if sl in label.lower():
             match_t, match_n = ticker, label.split(" (")[0]; break
-    # 2. symbol match
     if not match_t:
         for label, ticker in ALL_STOCKS.items():
             sym = ticker.replace(".NS","")
@@ -912,7 +894,6 @@ if search:
     if match_t:
         selected_ticker, selected_name = match_t, match_n
     else:
-        # Custom ticker — try as NSE first
         candidate = search.upper()
         if not candidate.endswith(".NS") and not candidate.endswith(".BO") and "^" not in candidate:
             candidate = candidate + ".NS"
@@ -951,7 +932,6 @@ if is_dashboard:
         except Exception:
             col.warning(name)
 
-    # Nifty 50 chart
     try:
         n50 = idx_data.get("^NSEI")
         if n50 is not None and not n50.empty:
@@ -995,12 +975,13 @@ with st.sidebar:
     st.caption("⚠️ Not SEBI registered. Statistical analysis only. Not financial advice. Data: Yahoo Finance.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LOAD + VALIDATE DATA
+# LOAD + VALIDATE DATA (WITH DYNAMIC HORIZON PERIOD)
 # ══════════════════════════════════════════════════════════════════════════════
-with st.spinner(f"Loading {selected_name} ({selected_ticker})..."):
-    raw_df = load_ohlcv(selected_ticker, period="5y")
+history_period = st.session_state.get("fc_history_period", "2y")
+with st.spinner(f"Loading {selected_name} ({selected_ticker}) with {history_period} history..."):
+    raw_df = load_ohlcv(selected_ticker, period=history_period)
 
-if raw_df is None or len(raw_df) < 60:
+if raw_df is None or len(raw_df) < 40:
     st.error(f"❌ Could not load data for **{selected_ticker}**.")
     if selected_ticker.endswith(".NS"):
         bse = selected_ticker.replace(".NS",".BO")
@@ -1009,11 +990,8 @@ if raw_df is None or len(raw_df) < 60:
         st.info("For NSE stocks append `.NS` (e.g. RELIANCE.NS). For BSE append `.BO`.")
     st.stop()
 
-# ── Session-state cache for add_indicators + run_backtest ────────────────────
-# Both are expensive (1250-row loop). We only recompute when ticker or
-# strategy actually changes — NOT on every widget interaction / script rerun.
-_df_cache_key = f"df__{selected_ticker}"
-_bt_cache_key = f"bt__{selected_ticker}__{backtest_strategy}"
+_df_cache_key = f"df__{selected_ticker}__{history_period}"
+_bt_cache_key = f"bt__{selected_ticker}__{backtest_strategy}__{history_period}"
 
 if _df_cache_key not in st.session_state:
     st.session_state[_df_cache_key] = add_indicators(raw_df)
@@ -1102,13 +1080,11 @@ with tab_chart:
             line=dict(color="rgba(124,78,255,0.5)",width=1,dash="dot"),
             fill="tonexty", fillcolor="rgba(124,78,255,0.04)"), row=1, col=1)
 
-    # Risk lines
     fig.add_hline(y=sl_price, line_dash="dash", line_color="rgba(255,51,85,0.6)",
                   annotation_text=f"SL ₹{sl_price:,.0f}", row=1, col=1)
     fig.add_hline(y=tp_price, line_dash="dash", line_color="rgba(0,232,122,0.6)",
                   annotation_text=f"TP ₹{tp_price:,.0f}", row=1, col=1)
 
-    # Trade markers (BUG FIX: y at low/high)
     if buy_x:
         fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode="markers", name="Buy Entry",
             marker=dict(symbol="triangle-up", size=9, color="#00e87a",
@@ -1118,20 +1094,17 @@ with tab_chart:
             marker=dict(symbol="triangle-down", size=9, color="#ff3355",
                         line=dict(width=1, color="#020813"))), row=1, col=1)
 
-    # RSI
     fig.add_trace(go.Scatter(x=df["Date"], y=df["RSI_14"], name="RSI 14",
         line=dict(color="#00c8ff",width=1.5)), row=2, col=1)
     for lvl, lc in [(70,"rgba(255,51,85,0.4)"),(30,"rgba(0,232,122,0.4)"),(50,"rgba(255,255,255,0.08)")]:
         fig.add_hline(y=lvl, line_dash="dot", line_color=lc, row=2, col=1)
 
-    # MACD
     mc_colors = ["#00e87a" if v>=0 else "#ff3355" for v in df["MACD_Hist"].fillna(0)]
     fig.add_trace(go.Bar(x=df["Date"], y=df["MACD_Hist"], name="MACD Hist", marker_color=mc_colors, opacity=0.7), row=3, col=1)
     fig.add_trace(go.Scatter(x=df["Date"], y=df["MACD"], name="MACD", line=dict(color="#00c8ff",width=1.2)), row=3, col=1)
     fig.add_trace(go.Scatter(x=df["Date"], y=df["MACD_Signal"], name="Signal", line=dict(color="#ffcc00",width=1.2,dash="dot")), row=3, col=1)
     fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.1)", row=3, col=1)
 
-    # Volume
     if show_vol and "Volume" in df.columns:
         vc = ["rgba(0,232,122,0.4)" if r["Close"] >= r["Open"] else "rgba(255,51,85,0.4)" for _,r in df.iterrows()]
         fig.add_trace(go.Bar(x=df["Date"], y=df["Volume"], name="Volume", marker_color=vc), row=4, col=1)
@@ -1154,7 +1127,6 @@ with tab_chart:
     ), row=1, col=1)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Indicator summary
     ls, rs = st.columns([1,2])
     with ls:
         st.markdown(f"""<div class="glass-card" style="text-align:center;">
@@ -1187,20 +1159,58 @@ with tab_chart:
         </div>""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 2: ARIMA FORECAST
+# TAB 2: ARIMA FORECAST (WITH HORIZON TIME ADJUSTER)
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_arima:
-    st.markdown(f'<p class="section-header">[ 🔮 ARIMA + HOLT-WINTERS FORECAST — {selected_name} → JUNE 2027 ]</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="section-header">[ 🔮 MULTI-HORIZON PRICE FORECAST — {selected_name} ]</p>', unsafe_allow_html=True)
+    
+    hz_col1, hz_col2 = st.columns(2)
+    with hz_col1:
+        horizon_type = st.radio(
+            "Forecast Horizon Type", 
+            ["Swing Trade (Days)", "Long-Term Hold (Years)"], 
+            index=0 if st.session_state.get("fc_horizon_type", "Swing Trade (Days)") == "Swing Trade (Days)" else 1,
+            key="horizon_type_selector"
+        )
+    with hz_col2:
+        if horizon_type == "Swing Trade (Days)":
+            steps_input = st.slider(
+                "Forecast Steps (Trading Days)", 
+                min_value=1, max_value=252, 
+                value=st.session_state.get("fc_steps", 60), step=1,
+                key="steps_slider"
+            )
+            if (st.session_state.get("fc_horizon_type") != "Swing Trade (Days)" or 
+                st.session_state.get("fc_steps") != steps_input):
+                st.session_state["fc_horizon_type"] = "Swing Trade (Days)"
+                st.session_state["fc_steps"] = steps_input
+                st.session_state["fc_history_period"] = "2y"
+                st.rerun()
+            steps = steps_input
+        else:
+            years_input = st.slider(
+                "Forecast Horizon (Years)", 
+                min_value=1, max_value=25, 
+                value=st.session_state.get("fc_years", 2), step=1,
+                key="years_slider"
+            )
+            if (st.session_state.get("fc_horizon_type") != "Long-Term Hold (Years)" or 
+                st.session_state.get("fc_years") != years_input):
+                st.session_state["fc_horizon_type"] = "Long-Term Hold (Years)"
+                st.session_state["fc_years"] = years_input
+                st.session_state["fc_history_period"] = "10y" if years_input <= 5 else "max"
+                st.rerun()
+            steps = years_input * 252
+
     price_series = df["Close"].astype(float).dropna()
     last_date    = pd.to_datetime(df["Date"].iloc[-1])
-    target_end   = pd.Timestamp("2027-06-30")
-    fc_dates     = pd.bdate_range(start=last_date + pd.Timedelta(days=1), end=target_end)
-    steps        = len(fc_dates)
+    fc_dates     = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=steps)
+    target_end   = fc_dates[-1]
 
     if steps <= 0:
-        st.warning("Data already extends past June 2027.")
+        st.warning("Data already extends past target horizon.")
     else:
-        with st.spinner("Running ARIMA (5×5 AIC grid) + Holt-Winters + 60-day accuracy validation..."):
+        with st.spinner(f"Fitting ARIMA + Holt-Winters model for {steps} steps..."):
             try:
                 fc_mean, fc_lo, fc_hi, arima_order, aic_val, arima_model, log_s = run_arima(price_series, steps)
                 fc_series = pd.Series(fc_mean.values, index=fc_dates)
@@ -1215,13 +1225,11 @@ with tab_arima:
                 upside_hw    = (target_hw - close) / close * 100
                 upside_c     = (consensus - close) / close * 100
 
-                # Accuracy validation
                 mape, dir_acc = compute_accuracy(price_series, arima_order, holdout=60)
 
-                # KPI row
                 fa1,fa2,fa3,fa4,fa5 = st.columns(5)
                 for col, lbl, val, clr in zip([fa1,fa2,fa3,fa4,fa5],
-                    ["Current Price","ARIMA Jun '27","Holt-Winters Jun '27","Consensus Target","Model"],
+                    ["Current Price", "ARIMA Target", "Holt-Winters Target", "Consensus Target", "Model Fitted"],
                     [f"₹{close:,.2f}",
                      f"₹{target_arima:,.0f} ({'▲' if upside_a>=0 else '▼'}{abs(upside_a):.1f}%)",
                      f"₹{target_hw:,.0f} ({'▲' if upside_hw>=0 else '▼'}{abs(upside_hw):.1f}%)",
@@ -1229,10 +1237,9 @@ with tab_arima:
                      f"ARIMA{arima_order}"],
                     ["#ddeeff","#fbbf24","#00c8ff","#00e87a","#ff6b35"]):
                     col.markdown(f'<div class="glass-card"><p class="glass-label">{lbl}</p>'
-                                 f'<div class="glass-value" style="color:{clr};font-size:1rem;">{val}</div></div>',
+                                 f'<div class="glass-value" style="color:{clr};font-size:0.95rem;">{val}</div></div>',
                                  unsafe_allow_html=True)
 
-                # Accuracy metrics row
                 if mape is not None:
                     am1, am2, am3 = st.columns(3)
                     mape_clr = "#00e87a" if mape < 5 else "#ffcc00" if mape < 10 else "#ff3355"
@@ -1250,17 +1257,14 @@ with tab_arima:
                                  f'<p style="font-size:10px;color:#6a90aa;margin:3px 0 0;">Lower = better fit</p></div>',
                                  unsafe_allow_html=True)
 
-                # Forecast chart
                 fig2 = go.Figure()
                 hp   = price_series.iloc[-504:]
                 hd   = pd.to_datetime(df["Date"].iloc[-504:])
-                fig2.add_trace(go.Scatter(x=hd, y=hp.values, name="Historical (2yr)", line=dict(color="#7c6ef8",width=1.8)))
+                fig2.add_trace(go.Scatter(x=hd, y=hp.values, name="Historical Data", line=dict(color="#7c6ef8",width=1.8)))
                 fig2.add_trace(go.Scatter(x=fc_series.index, y=fc_series.values, name="ARIMA", line=dict(color="#f97316",width=2,dash="dash")))
                 fig2.add_trace(go.Scatter(x=hw_series.index, y=hw_series.values, name="Holt-Winters", line=dict(color="#00c8ff",width=1.5,dash="dashdot")))
-                # Consensus shaded
                 fig2.add_trace(go.Scatter(x=fc_series.index, y=(fc_series.values+hw_series.values)/2, name="Consensus",
                     line=dict(color="#00e87a",width=1.5,dash="longdash")))
-                # CI band
                 fig2.add_trace(go.Scatter(
                     x=list(ci_hi.index)+list(ci_lo.index[::-1]),
                     y=list(ci_hi.values)+list(ci_lo.values[::-1]),
@@ -1268,7 +1272,7 @@ with tab_arima:
                     line=dict(color="rgba(0,0,0,0)"), name="ARIMA 90% CI"))
                 fig2.add_vline(x=str(last_date), line_dash="dot", line_color="rgba(100,100,100,0.4)")
                 fig2.add_annotation(x=str(target_end), y=consensus,
-                    text=f"Consensus Jun '27<br>₹{consensus:,.0f}",
+                    text=f"Consensus Target<br>{target_end.strftime('%d %b %Y')}<br>₹{consensus:,.0f}",
                     showarrow=True, arrowhead=2, arrowcolor="#00e87a",
                     font=dict(color="#00e87a",size=10), bgcolor="rgba(7,18,32,0.85)",
                     bordercolor="#00e87a", borderwidth=1)
@@ -1280,26 +1284,54 @@ with tab_arima:
                     yaxis=dict(gridcolor="rgba(0,200,255,0.04)",tickprefix="₹"))
                 st.plotly_chart(fig2, use_container_width=True)
 
-                # Monthly cards
-                st.markdown('<p class="section-header">[ 📅 MONTH-BY-MONTH ARIMA PRICE TARGETS ]</p>', unsafe_allow_html=True)
                 fc_df2 = pd.DataFrame({"Forecast":fc_series,"HW":hw_series,"CI_Lo":ci_lo,"CI_Hi":ci_hi})
-                fc_df2["Month"] = fc_df2.index.to_period("M")
-                monthly = fc_df2.groupby("Month").agg(
-                    Forecast=("Forecast","last"), HW=("HW","last"),
-                    CI_Lo=("CI_Lo","last"), CI_Hi=("CI_Hi","last")
-                ).reset_index()
-                monthly["Month_str"] = monthly["Month"].dt.strftime("%b %Y")
-                monthly["MoM_pct"]   = monthly["Forecast"].pct_change() * 100
-                monthly.loc[0,"MoM_pct"] = (monthly.loc[0,"Forecast"] - close) / close * 100
+                
+                if horizon_type == "Long-Term Hold (Years)" and years_input > 2:
+                    st.markdown('<p class="section-header">[ 📅 YEAR-BY-YEAR ARIMA PRICE TARGETS ]</p>', unsafe_allow_html=True)
+                    fc_df2["Year"] = fc_df2.index.to_period("A")
+                    yearly = fc_df2.groupby("Year").agg(
+                        Forecast=("Forecast","last"), HW=("HW","last"),
+                        CI_Lo=("CI_Lo","last"), CI_Hi=("CI_Hi","last")
+                    ).reset_index()
+                    yearly["Year_str"] = yearly["Year"].dt.strftime("Year %Y")
+                    yearly["YoY_pct"]   = yearly["Forecast"].pct_change() * 100
+                    yearly.loc[0,"YoY_pct"] = (yearly.loc[0,"Forecast"] - close) / close * 100
 
-                for i in range(0, len(monthly), 6):
-                    chunk = monthly.iloc[i:i+6]
-                    cols  = st.columns(len(chunk))
-                    for col, (_,row) in zip(cols, chunk.iterrows()):
-                        chg   = row["MoM_pct"]
-                        arrow = "▲" if chg>=0 else "▼"
-                        clr   = "#00e87a" if chg>=0 else "#ff3355"
-                        col.markdown(f"""
+                    for i in range(0, len(yearly), 6):
+                        chunk = yearly.iloc[i:i+6]
+                        cols  = st.columns(len(chunk))
+                        for col, (_,row) in zip(cols, chunk.iterrows()):
+                            chg   = row["YoY_pct"]
+                            arrow = "▲" if chg>=0 else "▼"
+                            clr   = "#00e87a" if chg>=0 else "#ff3355"
+                            col.markdown(f"""
+<div style="background:rgba(7,18,32,0.65);border:1px solid rgba(0,200,255,0.15);border-radius:6px;
+     padding:9px 7px;text-align:center;margin-bottom:6px;">
+  <div style="font-size:9px;font-family:'Space Mono',monospace;color:#6a90aa;text-transform:uppercase;">{row['Year_str']}</div>
+  <div style="font-family:'Orbitron',sans-serif;font-size:.95rem;font-weight:700;color:#fbbf24;margin:3px 0;">₹{row['Forecast']:,.0f}</div>
+  <div style="font-size:9px;color:{clr};font-weight:600;">{arrow} {abs(chg):.1f}%</div>
+  <div style="font-size:8px;color:rgba(100,120,140,0.8);margin-top:2px;">HW: ₹{row['HW']:,.0f}</div>
+  <div style="font-size:8px;color:rgba(100,120,140,0.5);">₹{row['CI_Lo']:,.0f}–₹{row['CI_Hi']:,.0f}</div>
+</div>""", unsafe_allow_html=True)
+                else:
+                    st.markdown('<p class="section-header">[ 📅 MONTH-BY-MONTH ARIMA PRICE TARGETS ]</p>', unsafe_allow_html=True)
+                    fc_df2["Month"] = fc_df2.index.to_period("M")
+                    monthly = fc_df2.groupby("Month").agg(
+                        Forecast=("Forecast","last"), HW=("HW","last"),
+                        CI_Lo=("CI_Lo","last"), CI_Hi=("CI_Hi","last")
+                    ).reset_index()
+                    monthly["Month_str"] = monthly["Month"].dt.strftime("%b %Y")
+                    monthly["MoM_pct"]   = monthly["Forecast"].pct_change() * 100
+                    monthly.loc[0,"MoM_pct"] = (monthly.loc[0,"Forecast"] - close) / close * 100
+
+                    for i in range(0, len(monthly), 6):
+                        chunk = monthly.iloc[i:i+6]
+                        cols  = st.columns(len(chunk))
+                        for col, (_,row) in zip(cols, chunk.iterrows()):
+                            chg   = row["MoM_pct"]
+                            arrow = "▲" if chg>=0 else "▼"
+                            clr   = "#00e87a" if chg>=0 else "#ff3355"
+                            col.markdown(f"""
 <div style="background:rgba(7,18,32,0.65);border:1px solid rgba(0,200,255,0.15);border-radius:6px;
      padding:9px 7px;text-align:center;margin-bottom:6px;">
   <div style="font-size:9px;font-family:'Space Mono',monospace;color:#6a90aa;text-transform:uppercase;">{row['Month_str']}</div>
@@ -1309,15 +1341,13 @@ with tab_arima:
   <div style="font-size:8px;color:rgba(100,120,140,0.5);">₹{row['CI_Lo']:,.0f}–₹{row['CI_Hi']:,.0f}</div>
 </div>""", unsafe_allow_html=True)
 
-                tbl = monthly[["Month_str","Forecast","HW","CI_Lo","CI_Hi","MoM_pct"]].round(2)
-                tbl.columns = ["Month","ARIMA ₹","Holt-Winters ₹","Lower ₹","Upper ₹","MoM %"]
+                tbl = fc_df2.round(2)
                 st.download_button("⬇️ Download Forecast CSV",
-                                   tbl.to_csv(index=False).encode(),
+                                   tbl.to_csv().encode(),
                                    f"{selected_name}_forecast.csv","text/csv")
 
                 with st.expander("🔬 Model diagnostics"):
                     pv = adfuller(np.log(price_series.dropna()))[1]
-                    
                     st.markdown(f"""
 | Parameter | Value |
 |---|---|
@@ -1422,9 +1452,6 @@ with tab_scan:
             results = []
 
             try:
-                # ── BATCH DOWNLOAD — single HTTP call for all tickers ──────────
-                # yf.download with a list of tickers is 5-10x faster than
-                # individual calls: one connection, one response, no per-stock RTT.
                 tickers_list = [t for _, t in pool]
                 prog.progress(0.1, text=f"Fetching {len(tickers_list)} stocks in one batch...")
 
@@ -1435,10 +1462,8 @@ with tab_scan:
                 )
                 prog.progress(0.5, text="Computing indicators for each stock...")
 
-                # ── Process each ticker from the batch result ─────────────────
                 for idx, (name, ticker_s) in enumerate(pool):
                     try:
-                        # Extract this ticker's slice from the MultiIndex batch result
                         if isinstance(batch_df.columns, pd.MultiIndex):
                             if ticker_s in batch_df.columns.get_level_values(0):
                                 sd = batch_df[ticker_s].copy()
@@ -1564,12 +1589,254 @@ with tab_risk:
         st.warning("Stop loss must be below entry price.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 6: PORTFOLIO OPTIMIZER
+# TAB 6: PORTFOLIO OPTIMIZER & CUSTOM PORTFOLIO ROTATION ADVISOR
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_port:
-    st.markdown('<p class="section-header">[ MPT PORTFOLIO OPTIMIZER — MONTE CARLO 3000 ]</p>', unsafe_allow_html=True)
+    # ── SUBSECTION 1: CUSTOM PORTFOLIO TRACKER & ROTATION ADVISOR ────────────
+    st.markdown('<p class="section-header">[ 💼 MY CUSTOM PORTFOLIO TRACKER & ROTATION ADVISOR ]</p>', unsafe_allow_html=True)
+    st.caption("Enter your custom portfolio details below to project 1-year returns and receive rotation optimization advice.")
+
+    # Initialize session state for custom portfolio
+    if "custom_portfolio" not in st.session_state:
+        st.session_state["custom_portfolio"] = pd.DataFrame([
+            {"Ticker": "RELIANCE", "Quantity": 10, "Buy Price (₹)": 2400.0},
+            {"Ticker": "TCS", "Quantity": 5, "Buy Price (₹)": 3800.0},
+            {"Ticker": "HDFCBANK", "Quantity": 15, "Buy Price (₹)": 1500.0}
+        ])
+
+    edited_portfolio = st.data_editor(
+        st.session_state["custom_portfolio"],
+        num_rows="dynamic",
+        column_config={
+            "Ticker": st.column_config.TextColumn("Stock Symbol", help="e.g. RELIANCE, TCS, SBIN", required=True),
+            "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
+            "Buy Price (₹)": st.column_config.NumberColumn("Buy Price (₹)", min_value=0.0, step=10.0, required=True)
+        },
+        use_container_width=True,
+        key="portfolio_editor"
+    )
+    st.session_state["custom_portfolio"] = edited_portfolio
+
+    # Process Portfolio Analysis
+    if not edited_portfolio.empty:
+        valid_rows = edited_portfolio.dropna(subset=["Ticker", "Quantity", "Buy Price (₹)"])
+        if not valid_rows.empty:
+            port_tickers_list = []
+            peer_tickers_map = {}
+            all_tickers_to_fetch = set()
+
+            for _, row in valid_rows.iterrows():
+                sym_resolved = resolve_ticker(str(row["Ticker"]))
+                port_tickers_list.append((str(row["Ticker"]), sym_resolved, int(row["Quantity"]), float(row["Buy Price (₹)"])))
+                all_tickers_to_fetch.add(sym_resolved)
+
+                # Get 2 peers from its sector
+                sector, peers = get_sector_peers(sym_resolved, max_peers=2)
+                if sector:
+                    peer_tickers_map[sym_resolved] = (sector, peers)
+                    for p in peers:
+                        all_tickers_to_fetch.add(p)
+
+            # Download all in one single batch
+            with st.spinner("Downloading portfolio and sector peer market data..."):
+                try:
+                    batch_port_df = yf.download(
+                        list(all_tickers_to_fetch), period="2y", interval="1d",
+                        auto_adjust=True, progress=False, timeout=25, group_by="ticker"
+                    )
+
+                    def get_ticker_df(ticker_sym):
+                        if isinstance(batch_port_df.columns, pd.MultiIndex):
+                            if ticker_sym in batch_port_df.columns.get_level_values(0):
+                                return batch_port_df[ticker_sym].dropna()
+                            elif ticker_sym in batch_port_df.columns.get_level_values(1):
+                                return batch_port_df.xs(ticker_sym, axis=1, level=1).dropna()
+                        else:
+                            return batch_port_df.dropna()
+                        return None
+
+                    # Forecast peer tickers to construct peer data database
+                    peer_info_db = {}
+                    for holding_sym, (sector, peers) in peer_tickers_map.items():
+                        if sector not in peer_info_db:
+                            peer_info_db[sector] = {}
+                        for peer in peers:
+                            try:
+                                pdf = get_ticker_df(peer)
+                                if pdf is not None and len(pdf) >= 50:
+                                    current_p = float(pdf["Close"].iloc[-1])
+                                    prices_s = pdf["Close"].astype(float)
+                                    log_s = np.log(prices_s)
+                                    arima_m = ARIMA(log_s, order=(1,1,1)).fit()
+                                    fc_arima = np.exp(arima_m.forecast(steps=252).iloc[-1])
+                                    fc_hw = run_holt_winters(prices_s, steps=252).iloc[-1]
+                                    proj_p = (fc_arima + fc_hw) / 2
+                                    proj_ret_pct = (proj_p - current_p) / current_p * 100
+
+                                    pdf_ind = add_indicators(pdf.reset_index())
+                                    sig = get_signal(pdf_ind)
+                                    stre = get_signal_strength(pdf_ind)
+
+                                    peer_info_db[sector][peer] = {
+                                        "_proj_return_pct": proj_ret_pct,
+                                        "_tech_sig": sig,
+                                        "_strength": stre
+                                    }
+                            except Exception:
+                                continue
+
+                    # Analyze custom portfolio holdings
+                    analyzed_rows = []
+                    total_cost_basis = 0.0
+                    total_current_value = 0.0
+                    total_proj_value_1y = 0.0
+
+                    for label_t, sym_resolved, qty, buy_px in port_tickers_list:
+                        try:
+                            hdf = get_ticker_df(sym_resolved)
+                            if hdf is not None and len(hdf) >= 40:
+                                current_p = float(hdf["Close"].iloc[-1])
+                                cost = qty * buy_px
+                                curr_val = qty * current_p
+
+                                # 1Y projections
+                                prices_s = hdf["Close"].astype(float)
+                                log_s = np.log(prices_s)
+                                arima_m = ARIMA(log_s, order=(1,1,1)).fit()
+                                fc_arima = np.exp(arima_m.forecast(steps=252).iloc[-1])
+                                fc_hw = run_holt_winters(prices_s, steps=252).iloc[-1]
+                                proj_p = (fc_arima + fc_hw) / 2
+                                proj_val_1y = qty * proj_p
+
+                                pnl_curr = curr_val - cost
+                                pnl_proj_1y = proj_val_1y - curr_val
+                                proj_ret_pct = (proj_p - current_p) / current_p * 100
+
+                                total_cost_basis += cost
+                                total_current_value += curr_val
+                                total_proj_value_1y += proj_val_1y
+
+                                hdf_ind = add_indicators(hdf.reset_index())
+                                sig = get_signal(hdf_ind)
+                                stre = get_signal_strength(hdf_ind)
+
+                                # Determine sector
+                                sector = None
+                                if sym_resolved in peer_tickers_map:
+                                    sector = peer_tickers_map[sym_resolved][0]
+                                if not sector:
+                                    clean = sym_resolved.replace(".NS","").replace(".BO","").upper()
+                                    for sec, list_of_stocks in SECTORS.items():
+                                        if any(sym == clean for _, sym in list_of_stocks):
+                                            sector = sec
+                                            break
+
+                                verdict = "⚪ HOLD"
+                                advice = "Hold. Ratios and technical readings are stable."
+                                v_clr = "#ffcc00"
+
+                                # Rotation Logic
+                                if sig == "SELL" or proj_ret_pct < 5.0 or stre < 40:
+                                    verdict = "🔴 ROTATE"
+                                    v_clr = "#ff3355"
+                                    # Look for sector peer
+                                    better_peer = None
+                                    best_peer_ret = proj_ret_pct
+                                    if sector and sector in peer_info_db:
+                                        for peer_sym, p_info in peer_info_db[sector].items():
+                                            if peer_sym != sym_resolved and p_info["_proj_return_pct"] > best_peer_ret + 5.0:
+                                                better_peer = peer_sym.replace(".NS","").replace(".BO","")
+                                                best_peer_ret = p_info["_proj_return_pct"]
+                                    
+                                    if better_peer:
+                                        advice = f"Consider rotating into **{better_peer}** (Sector: {sector}). It has a stronger signal and projected 1Y return of {best_peer_ret:.1f}% (+{best_peer_ret - proj_ret_pct:.1f}% uplift)."
+                                    else:
+                                        sc_results = st.session_state.get("scan_results")
+                                        market_alt = None
+                                        if sc_results:
+                                            buys = [s for s in sc_results if s["_sig"] == "BUY" and s["_str"] >= 70]
+                                            if buys:
+                                                buys_sorted = sorted(buys, key=lambda x: x["_str"], reverse=True)
+                                                market_alt = buys_sorted[0]["Ticker"]
+                                        if market_alt:
+                                            advice = f"Projected 1Y return is weak ({proj_ret_pct:.1f}%). Suggest rotating into market leader **{market_alt}** (Strength: {buys_sorted[0]['_str']}/100)."
+                                        else:
+                                            advice = f"Projected 1Y return is weak ({proj_ret_pct:.1f}%). Reallocate to cash or market leaders."
+                                elif sig == "BUY" and stre >= 65:
+                                    verdict = "🟢 ACCUMULATE"
+                                    v_clr = "#00e87a"
+                                    advice = f"Strong buy momentum (Strength: {stre}/100) and projected 1Y return of {proj_ret_pct:.1f}%."
+                                else:
+                                    verdict = "⚪ HOLD"
+                                    v_clr = "#ffcc00"
+                                    advice = f"Neutral technicals. Projected 1Y return: {proj_ret_pct:.1f}%."
+
+                                analyzed_rows.append({
+                                    "Stock": label_t.upper(),
+                                    "Qty": qty,
+                                    "Buy Price": f"₹{buy_px:,.2f}",
+                                    "Current Price": f"₹{current_p:,.2f}",
+                                    "Current Value": f"₹{curr_val:,.2f}",
+                                    "P&L": f"₹{pnl_curr:,.2f}",
+                                    "Projected 1Y Value": f"₹{proj_val_1y:,.2f}",
+                                    "Proj. 1Y %": f"{proj_ret_pct:+.1f}%",
+                                    "Advice": verdict,
+                                    "_adv_text": advice,
+                                    "_color": v_clr,
+                                    "_pnl": pnl_curr
+                                })
+                            else:
+                                analyzed_rows.append({
+                                    "Stock": label_t.upper(), "Qty": qty, "Buy Price": f"₹{buy_px:,.2f}",
+                                    "Current Price": "N/A", "Current Value": "N/A", "P&L": "₹0.00",
+                                    "Projected 1Y Value": "N/A", "Proj. 1Y %": "0.0%",
+                                    "Advice": "⚪ HOLD", "_adv_text": "Could not retrieve historical data.", "_color": "#ffcc00", "_pnl": 0.0
+                                })
+                        except Exception as e:
+                            st.warning(f"Error analyzing {label_t}: {e}")
+
+                    # Display custom portfolio KPIs
+                    total_pnl = total_current_value - total_cost_basis
+                    total_proj_pnl = total_proj_value_1y - total_current_value
+                    total_proj_return_pct = (total_proj_value_1y - total_current_value) / total_current_value * 100 if total_current_value > 0 else 0.0
+
+                    pk1, pk2, pk3, pk4 = st.columns(4)
+                    pk1.markdown(f'<div class="glass-card"><p class="glass-label">Total Cost Basis</p><div class="glass-value">₹{total_cost_basis:,.2f}</div></div>', unsafe_allow_html=True)
+                    pk2.markdown(f'<div class="glass-card"><p class="glass-label">Current Value</p><div class="glass-value" style="color:#00c8ff;">₹{total_current_value:,.2f}</div></div>', unsafe_allow_html=True)
+                    pk3.markdown(f'<div class="glass-card"><p class="glass-label">Total Current P&L</p><div class="glass-value" style="color:{"#00e87a" if total_pnl>=0 else "#ff3355"};">₹{total_pnl:,.2f} ({"+" if total_pnl>=0 else ""}{total_pnl/total_cost_basis*100:.2f}% if total_cost_basis>0 else 0)</div></div>', unsafe_allow_html=True)
+                    pk4.markdown(f'<div class="glass-card"><p class="glass-label">Projected 1Y Value</p><div class="glass-value" style="color:#00e87a;">₹{total_proj_value_1y:,.2f} ({total_proj_return_pct:+.1f}%)</div></div>', unsafe_allow_html=True)
+
+                    # Show details table
+                    disp_df = pd.DataFrame(analyzed_rows)
+                    st.dataframe(
+                        disp_df[["Stock", "Qty", "Buy Price", "Current Price", "Current Value", "P&L", "Projected 1Y Value", "Proj. 1Y %", "Advice"]],
+                        use_container_width=True, hide_index=True
+                    )
+
+                    # Show advice detail cards
+                    st.markdown('<p class="section-header">[ 🛡️ PORTFOLIO ROTATION ADVISORY DETAILS ]</p>', unsafe_allow_html=True)
+                    for item in analyzed_rows:
+                        st.markdown(f"""
+<div class="glass-card" style="border-left: 4px solid {item['_color']}; padding: 10px 14px; margin-bottom: 8px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+        <span style="font-family:'Orbitron',sans-serif; font-weight:700; color:#ddeeff; font-size:13px;">{item['Stock']}</span>
+        <span style="font-family:'Space Mono',monospace; font-size:11px; font-weight:bold; color:{item['_color']};">{item['Advice']}</span>
+    </div>
+    <div style="font-size:12px; color:#a0aec0; margin-top:5px; line-height:1.5;">
+        {item['_adv_text']}
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+                except Exception as e:
+                    st.error(f"Error during portfolio analysis run: {e}")
+
+    st.markdown("<br><hr style='border-color:rgba(0,200,255,0.08);'><br>", unsafe_allow_html=True)
+
+    # ── SUBSECTION 2: MPT PORTFOLIO OPTIMIZER (MONTE CARLO) ──────────────────
+    st.markdown('<p class="section-header">[ 💼 MPT PORTFOLIO OPTIMIZER — MONTE CARLO 3000 ]</p>', unsafe_allow_html=True)
     default_keys = [k for k in ALL_STOCKS if any(x in k for x in ["Reliance (", "TCS (", "HDFC Bank (", "Infosys (", "SBI ("])][:5]
-    sel_keys = st.multiselect("Select 2-10 assets", list(ALL_STOCKS.keys()), default=default_keys)
+    sel_keys = st.multiselect("Select 2-10 assets for optimization", list(ALL_STOCKS.keys()), default=default_keys)
 
     if len(sel_keys) < 2:
         st.warning("Select at least 2 assets.")
@@ -1677,7 +1944,6 @@ with tab_fii:
         df_fii, today_fii = parse_fii_dii(fii_data)
 
     if df_fii is not None and today_fii is not None:
-        # Today KPIs
         fii_net = float(today_fii["FII Net"])
         dii_net = float(today_fii["DII Net"])
         fii_clr = "#00e87a" if fii_net >= 0 else "#ff3355"
@@ -1697,7 +1963,6 @@ with tab_fii:
                          f'<div class="glass-value" style="color:{clr};font-size:1.1rem;">{val}</div></div>',
                          unsafe_allow_html=True)
 
-        # Interpretation
         sentiment_fii = "BULLISH" if fii_net > 0 else "BEARISH"
         sent_clr_fii  = "#00e87a" if fii_net > 0 else "#ff3355"
         if fii_net > 0 and dii_net > 0:
@@ -1715,7 +1980,6 @@ with tab_fii:
             <p style="font-size:12px;color:#a0aec0;margin:4px 0;line-height:1.6;">{market_view}</p>
         </div>''', unsafe_allow_html=True)
 
-        # Historical bar chart
         if len(df_fii) > 1:
             st.markdown('<p class="section-header">[ RECENT FII / DII DAILY NET FLOWS ]</p>', unsafe_allow_html=True)
             fig_fii = go.Figure()
@@ -1737,7 +2001,6 @@ with tab_fii:
             )
             st.plotly_chart(fig_fii, use_container_width=True)
 
-        # Detailed table
         st.markdown('<p class="section-header">[ DETAILED FLOW TABLE ]</p>', unsafe_allow_html=True)
         disp_fii = df_fii[["Date","FII Buy","FII Sell","FII Net","DII Buy","DII Sell","DII Net"]].copy()
         disp_fii = disp_fii.round(2)
@@ -1748,7 +2011,6 @@ with tab_fii:
     else:
         st.warning("Could not fetch FII/DII data from NSE India. NSE may be blocking automated requests.")
         st.info("**Why this happens:** NSE India requires cookie-based session authentication. The data is available at nseindia.com → Market Data → FII/DII Activity.")
-        # Fallback: show explanation
         st.markdown('''<div class="glass-card">
             <p class="section-header" style="margin-top:0;">Understanding FII / DII Flows</p>
             <div style="font-size:12px;color:#a0aec0;line-height:1.8;">
@@ -1773,7 +2035,6 @@ with tab_options:
         df_chain, pcr, max_pain, expiry = parse_options_chain(opt_data, close)
 
     if df_chain is not None and len(df_chain) > 0:
-        # KPI row
         o1, o2, o3, o4 = st.columns(4)
         pcr_clr  = "#00e87a" if pcr and pcr > 1 else "#ff3355" if pcr and pcr < 0.7 else "#ffcc00"
         pain_clr = "#00c8ff"
@@ -1789,7 +2050,6 @@ with tab_options:
                          f'<div class="glass-value" style="color:{clr};font-size:1.1rem;">{val}</div></div>',
                          unsafe_allow_html=True)
 
-        # PCR interpretation
         if pcr:
             if pcr > 1.2:
                 pcr_interp = "HIGH PCR (>1.2) — Bearish sentiment dominant. Contrarian signal: markets may be oversold, potential reversal up."
@@ -1804,14 +2064,12 @@ with tab_options:
                         f'<p style="font-size:12px;color:{pi_clr};margin:4px 0;font-weight:600;">{pcr_interp}</p></div>',
                         unsafe_allow_html=True)
 
-        # Max pain interpretation
         if max_pain:
             mp_interp = f"Spot (₹{close:,.0f}) is {updown} max pain (₹{max_pain:,.0f}) by {pct_from_pain:.1f}%. Option sellers profit most if expiry is at ₹{max_pain:,.0f}. Gravitational pull toward max pain as expiry approaches."
             st.markdown(f'<div class="glass-card"><p class="glass-label">Max Pain Analysis</p>'
                         f'<p style="font-size:12px;color:#a0aec0;margin:4px 0;line-height:1.6;">{mp_interp}</p></div>',
                         unsafe_allow_html=True)
 
-        # OI chart — top 15 strikes around spot
         st.markdown('<p class="section-header">[ OPEN INTEREST BY STRIKE ]</p>', unsafe_allow_html=True)
         spot_strikes = df_chain[(df_chain["Strike"] >= close * 0.85) & (df_chain["Strike"] <= close * 1.15)]
         if len(spot_strikes) > 0:
@@ -1836,10 +2094,8 @@ with tab_options:
             )
             st.plotly_chart(fig_oi, use_container_width=True)
 
-        # Full chain table
         st.markdown('<p class="section-header">[ FULL OPTIONS CHAIN TABLE ]</p>', unsafe_allow_html=True)
         chain_disp = df_chain[["CE LTP","CE OI","CE IV","Strike","PE IV","PE OI","PE LTP"]].copy()
-        # Highlight ATM strikes
         chain_disp["ATM"] = df_chain["Strike"].apply(lambda s: "◀ ATM" if abs(s - close) == df_chain["Strike"].apply(lambda x: abs(x-close)).min() else "")
         st.dataframe(chain_disp.round(2), use_container_width=True, hide_index=True)
         st.download_button("⬇️ Download Options Chain",
@@ -1870,18 +2126,7 @@ with tab_funds:
     with st.spinner(f"Fetching fundamentals for {selected_name}..."):
         fund_data, fund_url = fetch_fundamentals(selected_ticker)
 
-    # Always show the gauge layout, fill with data if available
-    FUND_META = [
-        ("P/E Ratio",      "pe",  0, 60,  25, "Lower = cheaper. Indian market avg ~22. <15 undervalued, >40 expensive."),
-        ("P/B Ratio",      "pb",  0, 10,   3, "Price to Book. <1 = trading below assets. >5 = growth premium."),
-        ("ROE (%)",        "roe", 0, 50,  15, "Return on Equity. >15% is good. >25% is excellent."),
-        ("ROCE (%)",       "roce",0, 50,  15, "Return on Capital Employed. >15% shows efficient capital use."),
-        ("Debt/Equity",    "de",  0,  5,   1, "Lower is better. <0.5 is conservative. >2 is high leverage."),
-        ("Div Yield (%)",  "dy",  0,  8,   2, "Dividend Yield. >2% is decent for Indian markets."),
-    ]
-
     if fund_data and any(v is not None for v in fund_data.values()):
-        # Show ratio cards
         cols_f = st.columns(3)
         ratio_keys = [("P/E Ratio","#00c8ff"),("P/B Ratio","#ffcc00"),("ROE (%)","#00e87a"),
                       ("ROCE (%)","#00e87a"),("Debt/Equity","#ff3355"),("Div Yield (%)","#7c4dff")]
@@ -1894,10 +2139,9 @@ with tab_funds:
                 unsafe_allow_html=True
             )
 
-        # EPS and Promoter
         ep1, ep2 = st.columns(2)
         eps  = fund_data.get("EPS (TTM)")
-        prom = fund_data.get("Promoter Hold%")
+        prom = fund_data.get("Promoter Holding")
         ep1.markdown(
             f'<div class="glass-card"><p class="glass-label">EPS (TTM)</p>'
             f'<div class="glass-value" style="color:#fbbf24;">{"₹"+str(round(eps,2)) if eps else "N/A"}</div></div>',
@@ -1907,7 +2151,6 @@ with tab_funds:
             f'<div class="glass-value" style="color:{"#00e87a" if prom and prom>50 else "#ffcc00" if prom else "#6a90aa"};">{""+str(round(prom,1))+"%" if prom else "N/A"}</div></div>',
             unsafe_allow_html=True)
 
-        # Valuation verdict
         pe  = fund_data.get("P/E Ratio")
         roe = fund_data.get("ROE (%)")
         de  = fund_data.get("Debt/Equity")
@@ -1924,12 +2167,10 @@ with tab_funds:
 
         st.caption("Data source: Screener.in · Refreshed daily · Garbage/out-of-range values are filtered")
         st.markdown(f"[View full analysis on Screener.in]({fund_url})")
-
     else:
         st.warning(f"Could not fetch fundamental data for {selected_name} from Screener.in.")
         st.info("Screener.in covers most NSE-listed companies. Try large-cap stocks like RELIANCE, TCS, HDFCBANK.")
 
-    # Always show the ratio reference guide
     with st.expander("📖 Ratio interpretation guide"):
         st.markdown("""
 | Ratio | Good | Average | Expensive/Risky |
@@ -1945,7 +2186,7 @@ with tab_funds:
 """)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 7: NEWS & SENTIMENT
+# TAB: NEWS & SENTIMENT
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_news:
     st.markdown(f'<p class="section-header">[ NEWS & SENTIMENT — {selected_name} ]</p>', unsafe_allow_html=True)
@@ -1993,7 +2234,7 @@ with tab_news:
         st.caption("Large-cap stocks like TCS, RELIANCE, HDFCBANK have best news coverage.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 8: FII / DII FLOWS
+# TAB: HELP/MANUAL
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_help:
     st.markdown("""
@@ -2016,6 +2257,8 @@ with tab_help:
 <b style="color:#7c4dff;">PORTFOLIO OPTIMIZER</b> — Markowitz MPT with 3000 Monte Carlo simulations. Finds efficient frontier.<br>
 <b style="color:#7c4dff;">BACKTEST</b> — 4 strategies tested on 5-year data. Next-day open execution eliminates look-ahead bias.<br>
 <b style="color:#7c4dff;">SCANNER</b> — Multi-threaded bulk scan of selected sectors with BUY/SELL/HOLD signals and position sizing.<br>
+<br>
+<b style="color:#ffcc00;">PORTFOLIO ROTATION ADVISOR:</b> Analyzes holdings using a 1-year ARIMA + Holt-Winters consensus forecast. Recommends 'Rotate' to cash or higher projected peer alternatives if returns are weak (&lt;5%) or technicals are bearish.<br>
 <br>
 <b style="color:#ff3355;">SIGNAL LOGIC:</b> BUY = SMA20&gt;SMA50 AND Price&gt;SMA200 AND RSI&lt;70 AND (MACD cross up OR RSI&lt;45). SELL = opposite.<br>
 <br>
