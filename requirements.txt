@@ -1,5 +1,4 @@
-Perfect — you're most of the way there. You just need to update 2-3 files in that repo and push. Here's the exact playbook:
-Action: file_editor create /app/streamlit_app/requirements.txt --file-text "streamlit>=1.36
+streamlit>=1.36
 yfinance>=0.2.40
 pandas>=2.0
 numpy>=1.24
@@ -11,7 +10,3 @@ reportlab>=4.0
 nest_asyncio>=1.6
 emergentintegrations
 --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/
-"
-Observation: Create successful: /app/streamlit_app/requirements.txt
-
-Installing dependencies from requirements.txt
